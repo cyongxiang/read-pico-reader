@@ -93,7 +93,9 @@ class Operation {
   bool begin(Kind kind, const WeReadStore::ShelfRecord* book = nullptr, DownloadOptions options = {},
              ShelfCoverScope shelfCoverScope = ShelfCoverScope::None);
   bool beginProgressSync(const char* bookId, ProgressSyncInput input, ProgressSyncMode mode);
-  bool beginBrowseCache(const WeReadStore::BookRecord& book);
+  // 按章拉取网友划线+想法（review/list）；章 uid 必填，空则 Protocol 错。
+  // / Per-chapter reviews fetch (review/list); the chapter uid is required.
+  bool beginBrowseCache(const WeReadStore::BookRecord& book, const char* chapterUid);
   Event step(WeReadStore::WorkCallback callback = nullptr, void* callbackContext = nullptr);
   void cancel();
   void reset();
@@ -426,11 +428,12 @@ class Operation {
   char psvts_[128] = {};
   float initialProgressFraction_ = 0.0f;
   bool initialProgressValid_ = false;
-  WeReadBrowse::Kind browseKind_ = WeReadBrowse::Kind::PopularHighlights;
+  WeReadBrowse::Kind browseKind_ = WeReadBrowse::Kind::PopularReviews;
   WeReadBrowse::Cursor browseCursor_;
   WeReadBrowse::Cursor browseFirstReviewCursor_;
   WeReadBrowse::CacheManifest browseManifest_;
   bool browseCacheActive_ = false;
+  char browseChapterUid_[64] = {};
   char imageHost_[128] = {};
   WeReadProtocol::ImageType coverType_ = WeReadProtocol::ImageType::None;
   char cookie_[kCookieSize] = {};

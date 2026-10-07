@@ -10,6 +10,7 @@
 #include "WeReadClient.h"
 #include "HalStorage.h"
 #include "TimeUtils.h"
+#include "weread_notes.h"
 #include "esp_heap_caps.h"
 #include "esp_log.h"
 extern "C" {
@@ -42,6 +43,8 @@ static bool s_include_images = true;
 static weread_action_t s_action;
 static unsigned s_page, s_index, s_queue_count;
 static weread_selection_t* s_queue;
+static char s_book_id[64];      ///< 章级拉取目标书号 / Target book for chapter fetch
+static char s_chapter_uid[64];  ///< 章级拉取目标章 / Target chapter uid
 bool pico_weread_cancelled() { return s_cancel.load(); }
 
 static void log_memory(const char* stage) {
@@ -167,6 +170,43 @@ static bool resolve_selection(unsigned index, const char* id, WeReadStore::Shelf
     }
     return false;
 }
+// 按章拉取划线想法缓存：引擎原生 browse 状态机（当前章 review/list + 续期 + SD 提交）。
+// / Per-chapter thoughts cache via the engine's native browse state machine (review/list).
+static bool run_browse(WeReadClient::Operation& op, const WeReadStore::ShelfRecord& selected,
+                       const char* chapter_uid) {
+    if (!op.beginBrowseCache(WeReadStore::bookRecord(selected), chapter_uid)) {
+        set_state(WEREAD_FAILED, static_cast<int>(op.error())); return false;
+    }
+    set_state(WEREAD_WORKING);
+    while (op.active()) {
+        if (s_cancel.load()) op.cancel();
+        const auto event = op.step(progress_callback, &op);
+        if (event == WeReadClient::Operation::Event::QrReady) {
+            lock(); snprintf(s_status.qr, sizeof(s_status.qr), "%.319s", op.qrUrl());
+            s_status.state = WEREAD_QR; ++s_status.revision; unlock();
+        } else if (event == WeReadClient::Operation::Event::Authenticated) set_state(WEREAD_WORKING);
+        if (event == WeReadClient::Operation::Event::Complete) {
+            // 串口验收：打印本章 review/list 记录条数。
+            // / Serial acceptance log: this chapter's review record count.
+            WeReadStore::Session session;
+            WeReadBrowse::CacheManifest manifest;
+            if (WeReadStore::loadSession(session) && session.vid[0] &&
+                WeReadBrowse::loadCache(selected.bookId, chapter_uid, session.vid, manifest)) {
+                ESP_LOGI("weread", "chapter reviews cached: book=%s ch=%s reviews=%u",
+                         selected.bookId, chapter_uid,
+                         (unsigned)manifest.recordCounts[WeReadBrowse::kindIndex(WeReadBrowse::Kind::PopularReviews)]);
+            }
+            session.clear();
+            return true;
+        }
+        if (event == WeReadClient::Operation::Event::Failed) {
+            set_state(WEREAD_FAILED, static_cast<int>(op.error())); return false;
+        }
+        if (event == WeReadClient::Operation::Event::Cancelled) { set_state(WEREAD_CANCELLED); return false; }
+        vTaskDelay(pdMS_TO_TICKS(30));
+    }
+    return false;
+}
 static bool run_operation(WeReadClient::Operation& op, const WeReadStore::ShelfRecord* selected) {
     WeReadClient::DownloadOptions options;
     options.imagePolicy = s_include_images ? WeReadStore::ImagePolicy::Embed : WeReadStore::ImagePolicy::Exclude;
@@ -215,6 +255,61 @@ static void worker(void*) {
         const bool session = WeReadStore::clearSession();
         const bool shelf = WeReadStore::clearShelf() && WeReadBrowse::clearAllCaches();
         if (load_page(0)) set_state(session && shelf ? WEREAD_COMPLETE : WEREAD_FAILED, session && shelf ? 0 : 103);
+    } else if (s_action == WEREAD_NOTES) {
+        set_state(WEREAD_CONNECTING);
+        if (connect_online(owned_network) && !s_cancel.load()) {
+            WeReadStore::ShelfRecord selected;
+            // 书号优先（阅读页整本拉取路由），详情页按钮仍按索引解析。
+            // / Book id first (the reader's whole-book route); the detail button resolves by index.
+            if (!resolve_selection(s_index, s_book_id[0] ? s_book_id : nullptr, selected))
+                set_state(WEREAD_FAILED, 103);
+            else {
+                set_state(WEREAD_WORKING);
+                // 双粒度进度：done/target=章，notes_done/notes_total=想法条数（总数未知为 0）。
+                // / Two granularities: chapters in done/target, thought counts in notes_*.
+                struct ProgressCtx {
+                    void report(unsigned done, unsigned total) {
+                        lock();
+                        s_status.done = done; s_status.target = total;
+                        ++s_status.revision;
+                        unlock();
+                    }
+                    void report_notes(unsigned notes, unsigned total) {
+                        lock();
+                        s_status.notes_done = notes; s_status.notes_total = total;
+                        ++s_status.revision;
+                        unlock();
+                    }
+                } progress_ctx;
+                const auto on_progress = [](void* raw, unsigned done, unsigned total) {
+                    static_cast<ProgressCtx*>(raw)->report(done, total);
+                };
+                const auto on_notes = [](void* raw, unsigned notes, unsigned total) {
+                    static_cast<ProgressCtx*>(raw)->report_notes(notes, total);
+                };
+                const auto on_cancel = [](void*) { return s_cancel.load(); };
+                // 返回值即状态页错误码：0 成功，2 网络，3 登录，6 存储，10 内存，12 目录缺失。
+                // / The return value is the status-page error code (see weread_notes.h).
+                const int notes_error =
+                    weread_notes_fetch(selected.bookId, on_cancel, nullptr, on_progress, &progress_ctx,
+                                       on_notes, &progress_ctx);
+                if (notes_error == 0) set_state(WEREAD_COMPLETE);
+                else set_state(s_cancel.load() ? WEREAD_CANCELLED : WEREAD_FAILED, notes_error);
+            }
+        }
+    } else if (s_action == WEREAD_THOUGHTS) {
+        // 按章 review/list 拉取：章上下文由 weread_start_chapter_reviews 设置。
+        // / Per-chapter review/list fetch; context set by weread_start_chapter_reviews.
+        set_state(WEREAD_CONNECTING);
+        if (connect_online(owned_network) && !s_cancel.load()) {
+            void* memory = heap_caps_malloc(sizeof(WeReadClient::Operation), MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+            if (memory) op = new (memory) WeReadClient::Operation();
+            WeReadStore::ShelfRecord selected;
+            if (!op) set_state(WEREAD_FAILED, 10);
+            else if (!s_book_id[0] || !s_chapter_uid[0] || !resolve_selection(0, s_book_id, selected))
+                set_state(WEREAD_FAILED, 103);
+            else if (run_browse(*op, selected, s_chapter_uid)) set_state(WEREAD_COMPLETE);
+        }
     } else {
         set_state(WEREAD_CONNECTING);
         if (connect_online(owned_network) && !s_cancel.load()) {
@@ -241,6 +336,9 @@ static void worker(void*) {
                     if (!found) set_state(WEREAD_FAILED, 103);
                     const bool success = found && run_operation(*op, &selected);
                     op->reset();
+                    // 下载后不再自动拉划线想法：数据源已切到按章 review/list，无章上下文；
+                    // 章级补拉由阅读页 set_chapter 触发。/ No post-download auto fetch: the
+                    // source is per-chapter now; the reader page triggers chapter fetches.
                     if (s_cancel.load()) break;
                     lock();
                     if (success) ++s_status.batch_success; else ++s_status.batch_failed;
@@ -276,7 +374,8 @@ extern "C" bool weread_configure(const char* cache, const char* books) {
     return true;
 }
 static bool dispatch(weread_action_t action, unsigned page, unsigned index,
-                     const weread_selection_t* selection, unsigned count) {
+                     const weread_selection_t* selection, unsigned count,
+                     const char* book_id = nullptr, const char* chapter_uid = nullptr) {
     if (!initialize() || !s_configured) return false;
     weread_selection_t* queue = nullptr;
     if (action == WEREAD_BATCH) {
@@ -293,13 +392,33 @@ static bool dispatch(weread_action_t action, unsigned page, unsigned index,
             queue[i] = selection[i];
         }
     }
+    if (action == WEREAD_THOUGHTS &&
+        (!book_id || !book_id[0] || !chapter_uid || !chapter_uid[0] ||
+         strlen(book_id) >= sizeof(s_book_id) || strlen(chapter_uid) >= sizeof(s_chapter_uid))) {
+        heap_caps_free(queue); return false;
+    }
+    // 整本划线想法路由可带书号（阅读页），也可不带（详情页按索引解析）。
+    // / Whole-book notes route takes an optional book id (reader) or resolves by index (detail page).
+    if (action == WEREAD_NOTES && book_id && book_id[0] && strlen(book_id) >= sizeof(s_book_id)) {
+        heap_caps_free(queue); return false;
+    }
     lock();
     if (s_status.active) { unlock(); heap_caps_free(queue); return false; }
     while (xSemaphoreTake(s_finished, 0) == pdTRUE) {}
     s_cancel.store(false);
     s_action = action; s_page = page; s_index = index; s_queue = queue; s_queue_count = count;
+    if (action == WEREAD_THOUGHTS) {
+        snprintf(s_book_id, sizeof(s_book_id), "%s", book_id);
+        snprintf(s_chapter_uid, sizeof(s_chapter_uid), "%s", chapter_uid);
+    } else if (action == WEREAD_NOTES && book_id && book_id[0]) {
+        snprintf(s_book_id, sizeof(s_book_id), "%s", book_id);
+        s_chapter_uid[0] = 0;
+    } else {
+        s_book_id[0] = s_chapter_uid[0] = 0;
+    }
     s_status.action = action; s_status.active = true; s_status.qr[0] = s_status.output[0] = s_status.batch_title[0] = 0;
     s_status.done = s_status.target = s_status.skipped_images = 0; s_status.error = 0;
+    s_status.notes_done = s_status.notes_total = 0;
     s_status.batch_total = count; s_status.batch_current = s_status.batch_success = s_status.batch_failed = 0;
     s_status.stage = WEREAD_CHAPTERS; s_status.state = WEREAD_WORKING; ++s_status.revision;
     unlock(); log_memory("dispatch");
@@ -311,8 +430,17 @@ static bool dispatch(weread_action_t action, unsigned page, unsigned index,
     return true;
 }
 extern "C" bool weread_start(weread_action_t action, unsigned page, unsigned index) {
-    if (action < WEREAD_LOAD || action > WEREAD_LOGOUT) return false;
+    if (action < WEREAD_LOAD || action > WEREAD_NOTES || action == WEREAD_THOUGHTS) return false;
     return dispatch(action, page, index, nullptr, 0);
+}
+extern "C" bool weread_start_chapter_reviews(const char* book_id, const char* chapter_uid) {
+    return dispatch(WEREAD_THOUGHTS, 0, 0, nullptr, 0, book_id, chapter_uid);
+}
+// 整本划线想法：书号优先；空书号时 worker 回退按 s_index 解析书架记录。
+// / Whole-book notes: book id first; empty id falls back to shelf-index resolution in the worker.
+extern "C" bool weread_start_notes(const char* book_id) {
+    if (!book_id || !book_id[0]) return false;
+    return dispatch(WEREAD_NOTES, 0, 0, nullptr, 0, book_id, nullptr);
 }
 extern "C" bool weread_start_batch(unsigned page, const weread_selection_t* selection, unsigned count) {
     return dispatch(WEREAD_BATCH, page, 0, selection, count);
@@ -328,6 +456,13 @@ extern "C" void weread_stop() {
     lock(); const bool active = s_status.active; unlock();
     if (active) xSemaphoreTake(s_finished, portMAX_DELAY);
 }
+extern "C" bool weread_cancel_clear_if_idle(void) {
+    if (!initialize()) return false;
+    lock(); const bool active = s_status.active; unlock();
+    if (active) return false;  // 忙时不碰取消语义。/ Never touch cancellation while busy.
+    s_cancel.store(false);
+    return true;
+}
 
 extern "C" bool weread_set_include_images(bool enabled) {
     if (!initialize()) return false;
@@ -336,4 +471,123 @@ extern "C" bool weread_set_include_images(bool enabled) {
     s_include_images = enabled;
     unlock();
     return true;
+}
+
+// ---- 划线想法缓存读取（UI 线程；仅在后台任务空闲时调用） ----
+// ---- Thoughts cache reader (UI thread; call only while no worker runs) ----
+static WeReadBrowse::CacheManifest* s_thought_manifest;
+static char s_thought_book[64];
+static char s_thought_vid[64];
+static char s_thought_chapter[64];
+
+static WeReadBrowse::Kind thought_kind(unsigned kind) {
+    return kind == WEREAD_THOUGHT_REVIEWS ? WeReadBrowse::Kind::PopularReviews
+        : kind == WEREAD_THOUGHT_MINE ? WeReadBrowse::Kind::MyHighlights
+        : WeReadBrowse::Kind::PopularHighlights;
+}
+
+// 缓存按章落盘；book 级 open 仅保留给旧调用点（永远无新缓存，自然失败）。
+// / Per-chapter caches; the book-level open stays only for legacy callers and always misses.
+static bool thoughts_open_locked_source(const char* book_id, const char* chapter_uid) {
+    WeReadStore::Session session;
+    if (!WeReadStore::loadSession(session) || !session.vid[0]) return false;
+    auto* manifest = static_cast<WeReadBrowse::CacheManifest*>(
+        heap_caps_calloc(1, sizeof(WeReadBrowse::CacheManifest), MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT));
+    if (!manifest) return false;
+    if (!WeReadBrowse::loadCache(book_id, chapter_uid, session.vid, *manifest)) {
+        heap_caps_free(manifest); return false;
+    }
+    lock();
+    heap_caps_free(s_thought_manifest);
+    s_thought_manifest = manifest;
+    snprintf(s_thought_book, sizeof(s_thought_book), "%s", book_id);
+    snprintf(s_thought_vid, sizeof(s_thought_vid), "%s", session.vid);
+    snprintf(s_thought_chapter, sizeof(s_thought_chapter), "%s", chapter_uid ? chapter_uid : "");
+    unlock();
+    session.clear();
+    return true;
+}
+
+extern "C" bool weread_thoughts_open_chapter(const char* book_id, const char* chapter_uid) {
+    if (!initialize() || !book_id || !book_id[0] || !chapter_uid || !chapter_uid[0] ||
+        strlen(book_id) >= sizeof(s_thought_book) || strlen(chapter_uid) >= sizeof(s_thought_chapter)) return false;
+    lock();
+    const bool same = s_thought_manifest && !strcmp(s_thought_book, book_id) &&
+                      !strcmp(s_thought_chapter, chapter_uid);
+    unlock();
+    if (same) return true;
+    return thoughts_open_locked_source(book_id, chapter_uid);
+}
+
+extern "C" bool weread_thoughts_open(const char* book_id) {
+    if (!initialize() || !book_id || !book_id[0] || strlen(book_id) >= sizeof(s_thought_book)) return false;
+    lock();
+    const bool same = s_thought_manifest && !strcmp(s_thought_book, book_id) && !s_thought_chapter[0];
+    unlock();
+    if (same) return true;
+    return thoughts_open_locked_source(book_id, "");
+}
+
+extern "C" unsigned weread_thoughts_count(unsigned kind) {
+    if (kind >= WeReadBrowse::kKindCount) return 0;
+    lock();
+    const unsigned count = s_thought_manifest ? s_thought_manifest->recordCounts[kind] : 0;
+    unlock();
+    return count;
+}
+
+extern "C" bool weread_thoughts_get(unsigned kind, unsigned index, char* text, size_t cap,
+                                    weread_thought_meta_t* out) {
+    if (!text || !cap) return false;
+    text[0] = 0;
+    if (out) memset(out, 0, sizeof(*out));
+    if (kind >= WeReadBrowse::kKindCount) return false;
+    lock();
+    if (!s_thought_manifest || index >= s_thought_manifest->recordCounts[kind]) { unlock(); return false; }
+    const WeReadBrowse::CacheManifest manifest = *s_thought_manifest;
+    char book[64], chapter[64];
+    snprintf(book, sizeof(book), "%s", s_thought_book);
+    snprintf(chapter, sizeof(chapter), "%s", s_thought_chapter);
+    unlock();
+    if (!book[0]) return false;
+    const WeReadBrowse::Kind k = thought_kind(kind);
+    // 逐页累计定位记录；页头计数即页内条数。/ Walk pages; the header carries per-page counts.
+    uint32_t seen = 0;
+    for (uint32_t page = 0; page < manifest.pageCounts[kind]; ++page) {
+        WeReadBrowse::PageHeader header;
+        HalFile index_file, text_file;
+        if (!WeReadBrowse::openPage(book, chapter, manifest, k, page, header, index_file, text_file)) return false;
+        if (index < seen + header.count) {
+            WeReadBrowse::Record record;
+            const bool found = WeReadBrowse::readRecord(index_file, header, index - seen, record);
+            index_file.close();
+            if (!found) { text_file.close(); return false; }
+            const size_t want = record.textLength < cap - 1 ? record.textLength : cap - 1;
+            size_t got = 0;
+            if (want && text_file.seek(record.textOffset)) {
+                const int bytes = text_file.read(text, want);
+                if (bytes > 0) got = static_cast<size_t>(bytes);
+            }
+            text[got] = 0;
+            if (out) {
+                snprintf(out->chapter, sizeof(out->chapter), "%s", record.chapter);
+                snprintf(out->author, sizeof(out->author), "%s", record.author);
+                out->heat = record.heat;
+                out->rating = record.rating;
+                // 划线原文片段（review/list abstract 段）。/ Highlight excerpt from the abstract segment.
+                const size_t awant = record.abstractLength < sizeof(out->abstract) - 1
+                                         ? record.abstractLength : sizeof(out->abstract) - 1;
+                size_t agot = 0;
+                if (awant && text_file.seek(record.abstractOffset)) {
+                    const int bytes = text_file.read(out->abstract, awant);
+                    if (bytes > 0) agot = static_cast<size_t>(bytes);
+                }
+                out->abstract[agot] = 0;
+            }
+            text_file.close();
+            return true;
+        }
+        seen += header.count;
+    }
+    return false;
 }

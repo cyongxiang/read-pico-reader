@@ -1895,7 +1895,7 @@ bool Operation::active() const {
 
 void Operation::abortBrowseCache() {
   if (kind_ != Kind::Browse || !browseCacheActive_) return;
-  WeReadBrowse::abortCache(book_.bookId, browseManifest_.activeSlot);
+  WeReadBrowse::abortCache(book_.bookId, browseChapterUid_, browseManifest_.activeSlot);
   browseCacheActive_ = false;
 }
 
@@ -1960,11 +1960,12 @@ void Operation::reset() {
   psvts_[0] = '\0';
   initialProgressFraction_ = 0.0f;
   initialProgressValid_ = false;
-  browseKind_ = WeReadBrowse::Kind::PopularHighlights;
+  browseKind_ = WeReadBrowse::Kind::PopularReviews;
   browseCursor_ = {};
   browseFirstReviewCursor_ = {};
   browseManifest_ = {};
   browseCacheActive_ = false;
+  browseChapterUid_[0] = '\0';
   imageHost_[0] = '\0';
   coverType_ = WeReadProtocol::ImageType::None;
   // Shelf sync and download are separate jobs on the same account.
@@ -2050,16 +2051,20 @@ bool Operation::begin(const Kind kind, const WeReadStore::ShelfRecord* book, con
   return true;
 }
 
-bool Operation::beginBrowseCache(const WeReadStore::BookRecord& book) {
+bool Operation::beginBrowseCache(const WeReadStore::BookRecord& book, const char* chapterUid) {
   reset();
-  if (!isSafeProtocolToken(book.bookId)) {
+  if (!isSafeProtocolToken(book.bookId) || !chapterUid || !chapterUid[0] ||
+      !isSafeProtocolToken(chapterUid) || strlen(chapterUid) >= sizeof(browseChapterUid_)) {
     error_ = Error::Protocol;
     phase_ = Phase::Failed;
     return false;
   }
   kind_ = Kind::Browse;
   book_ = book;
-  browseKind_ = WeReadBrowse::Kind::PopularHighlights;
+  snprintf(browseChapterUid_, sizeof(browseChapterUid_), "%s", chapterUid);
+  // 数据源已切换：只拉当前章 review/list，不再走 bestbookmarks/bookmarklist。
+  // / Source switch: fetch only this chapter's review/list, never bestbookmarks/bookmarklist.
+  browseKind_ = WeReadBrowse::Kind::PopularReviews;
   browseCursor_ = {};
   WeReadStore::loadSession(session_);
   if (session_.valid()) {
@@ -2703,12 +2708,13 @@ Error Operation::fetchDetailOnce() {
 }
 
 Error Operation::fetchBrowseOnce() {
+  // 只拉当前章 review/list（listType=8/listMode=3）：逐条带 range+abstract 的网友划线想法。
+  // / Fetch only this chapter's review/list (listType=8/listMode=3): per-sentence reviews.
   const uint32_t recordLimit =
-      browseKind_ == WeReadBrowse::Kind::PopularReviews
-          ? browseReviewRequestCount(browseManifest_.recordCounts[WeReadBrowse::kindIndex(browseKind_)])
-          : WeReadBrowse::kMaxRecords;
+      browseReviewRequestCount(browseManifest_.recordCounts[WeReadBrowse::kindIndex(WeReadBrowse::Kind::PopularReviews)]);
   if (recordLimit == 0) return Error::Protocol;
-  auto parser = makeUniqueNoThrow<WeReadBrowse::ResponseParser>(book_.bookId, browseManifest_.activeSlot, browseKind_,
+  auto parser = makeUniqueNoThrow<WeReadBrowse::ResponseParser>(book_.bookId, browseChapterUid_,
+                                                                browseManifest_.activeSlot, browseKind_,
                                                                 browseCursor_.page, recordLimit);
   if (!parser) {
     LOG_ERR("WR", "OOM: browse parser (%zu bytes)", sizeof(WeReadBrowse::ResponseParser));
@@ -2726,22 +2732,15 @@ Error Operation::fetchBrowseOnce() {
 
   char encodedBookId[192];
   if (!WeReadProtocol::urlEncode(book_.bookId, encodedBookId, sizeof(encodedBookId))) return Error::Protocol;
+  char encodedChapterUid[160];
+  if (!WeReadProtocol::urlEncode(browseChapterUid_, encodedChapterUid, sizeof(encodedChapterUid)))
+    return Error::Protocol;
   auto* path = reinterpret_cast<char*>(ioBuffer_ + sizeof(ioBuffer_) - kUrlSize);
-  int length = 0;
-  switch (browseKind_) {
-    case WeReadBrowse::Kind::PopularHighlights:
-      length = snprintf(path, kUrlSize, "/web/book/bestbookmarks?bookId=%s", encodedBookId);
-      break;
-    case WeReadBrowse::Kind::MyHighlights:
-      length = snprintf(path, kUrlSize, "/web/book/bookmarklist?bookId=%s", encodedBookId);
-      break;
-    case WeReadBrowse::Kind::PopularReviews:
-      length =
-          snprintf(path, kUrlSize, "/web/review/list?bookId=%s&listType=3&listMode=2&maxIdx=%u&count=%u&synckey=%llu",
-                   encodedBookId, static_cast<unsigned>(browseCursor_.maxIdx), static_cast<unsigned>(recordLimit),
-                   static_cast<unsigned long long>(browseCursor_.syncKey));
-      break;
-  }
+  const int length =
+      snprintf(path, kUrlSize,
+               "/web/review/list?bookId=%s&chapterUid=%s&listType=8&listMode=3&maxIdx=%u&count=%u&synckey=%llu",
+               encodedBookId, encodedChapterUid, static_cast<unsigned>(browseCursor_.maxIdx),
+               static_cast<unsigned>(recordLimit), static_cast<unsigned long long>(browseCursor_.syncKey));
   if (length <= 0 || static_cast<size_t>(length) >= kUrlSize) return Error::Protocol;
 
   Error error =
@@ -2764,20 +2763,7 @@ Error Operation::fetchBrowseOnce() {
   browseManifest_.recordCounts[kind] += parser->count();
   browseManifest_.pageCounts[kind] = browseCursor_.page + 1;
 
-  switch (browseKind_) {
-    case WeReadBrowse::Kind::PopularHighlights:
-      browseKind_ = WeReadBrowse::Kind::MyHighlights;
-      browseCursor_ = {};
-      return Error::Ok;
-    case WeReadBrowse::Kind::MyHighlights:
-      browseKind_ = WeReadBrowse::Kind::PopularReviews;
-      browseCursor_ = {};
-      return Error::Ok;
-    case WeReadBrowse::Kind::PopularReviews:
-      break;
-  }
-
-  const uint32_t reviewCount = browseManifest_.recordCounts[WeReadBrowse::kindIndex(browseKind_)];
+  const uint32_t reviewCount = browseManifest_.recordCounts[WeReadBrowse::kindIndex(WeReadBrowse::Kind::PopularReviews)];
   if (parser->hasMore()) {
     const WeReadBrowse::Cursor nextCursor{
         browseCursor_.page + 1,
@@ -2798,7 +2784,7 @@ Error Operation::fetchBrowseOnce() {
   if (reviewCount == WeReadBrowse::kMaxCachedReviews && (parser->hasMore() || parser->responseTruncated())) {
     browseManifest_.flags |= WeReadBrowse::kCacheReviewsLimited;
   }
-  if (!WeReadBrowse::commitCache(book_.bookId, browseManifest_)) return Error::SdCard;
+  if (!WeReadBrowse::commitCache(book_.bookId, browseChapterUid_, browseManifest_)) return Error::SdCard;
   browseCacheActive_ = false;
   LOG_INF("WR", "browse TLS: new=%u reused=%u", static_cast<unsigned>(bookSession_.newConnections()),
           static_cast<unsigned>(bookSession_.reusedRequests()));
@@ -3697,9 +3683,10 @@ Operation::Event Operation::step(const WeReadStore::WorkCallback callback, void*
     }
 
     case Phase::PrepareBrowseCache:
-      if (!WeReadBrowse::beginCache(book_.bookId, session_.vid, browseManifest_)) return fail(Error::SdCard);
+      if (!WeReadBrowse::beginCache(book_.bookId, browseChapterUid_, session_.vid, browseManifest_))
+        return fail(Error::SdCard);
       browseCacheActive_ = true;
-      browseKind_ = WeReadBrowse::Kind::PopularHighlights;
+      browseKind_ = WeReadBrowse::Kind::PopularReviews;
       browseCursor_ = {};
       browseFirstReviewCursor_ = {};
       phase_ = Phase::FetchBrowse;
