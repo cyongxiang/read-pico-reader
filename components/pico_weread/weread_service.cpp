@@ -45,6 +45,11 @@ static unsigned s_page, s_index, s_queue_count;
 static weread_selection_t* s_queue;
 static char s_book_id[64];      ///< 章级拉取目标书号 / Target book for chapter fetch
 static char s_chapter_uid[64];  ///< 章级拉取目标章 / Target chapter uid
+static uint32_t s_report_offset;    ///< 阅读上报：章内字节偏移 / Read report: in-chapter byte offset
+static unsigned s_report_pct;       ///< 阅读上报：全书百分比 / Read report: whole-book percent
+static uint32_t s_report_seconds;   ///< 阅读上报：本次阅读秒数（rt）/ Read report: seconds read (rt)
+static bool s_report_has, s_report_ok;  ///< 本次开机最近一次上报尝试与结果 / Latest attempt this boot
+static int64_t s_report_epoch;          ///< 最近一次尝试时刻（设备秒，时钟无效为 0）/ Attempt time (0 = no clock)
 bool pico_weread_cancelled() { return s_cancel.load(); }
 
 static void log_memory(const char* stage) {
@@ -310,6 +315,56 @@ static void worker(void*) {
                 set_state(WEREAD_FAILED, 103);
             else if (run_browse(*op, selected, s_chapter_uid)) set_state(WEREAD_COMPLETE);
         }
+    } else if (s_action == WEREAD_READ_REPORT) {
+        // 阅读时长（rt）+进度一次性上报：UploadLocal 无条件上传，静默失败不打扰阅读。
+        // / One-shot reading-time (rt) + progress upload via UploadLocal; silent on failure.
+        set_state(WEREAD_CONNECTING);
+        bool sent = false;
+        if (connect_online(owned_network) && !s_cancel.load()) {
+            void* memory = heap_caps_malloc(sizeof(WeReadClient::Operation), MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+            if (memory) op = new (memory) WeReadClient::Operation();
+            if (!op) ESP_LOGW("weread", "read report OOM");
+            else {
+                WeReadClient::ProgressSyncInput input;
+                input.localFraction = s_report_pct / 100.0f;
+                input.localTocIndex = s_index;
+                input.localOffset = s_report_offset;
+                input.localOffsetBasis = WeReadClient::LocalOffsetBasis::VisibleText;
+                input.elapsedSeconds = s_report_seconds;
+                ESP_LOGI("weread", "read report: book=%s ch=%lu off=%lu pct=%u rt=%lu", s_book_id,
+                         (unsigned long)s_index, (unsigned long)s_report_offset, s_report_pct,
+                         (unsigned long)s_report_seconds);
+                if (op->beginProgressSync(s_book_id, input, WeReadClient::ProgressSyncMode::UploadLocal)) {
+                    while (op->active()) {
+                        if (s_cancel.load()) op->cancel();
+                        const auto event = op->step(progress_callback, &op);
+                        if (event == WeReadClient::Operation::Event::QrReady) {
+                            // 阅读中无人扫码：会话已过期，放弃本次上报。
+                            // / Nobody scans while reading: session expired; abandon this report.
+                            ESP_LOGW("weread", "read report: session expired");
+                            op->cancel();
+                        }
+                        if (event == WeReadClient::Operation::Event::Complete ||
+                            event == WeReadClient::Operation::Event::Failed ||
+                            event == WeReadClient::Operation::Event::Cancelled)
+                            break;
+                        vTaskDelay(pdMS_TO_TICKS(30));
+                    }
+                    sent = op->error() == WeReadClient::Error::Ok;
+                }
+                ESP_LOGI("weread", "read report %s (error=%d outcome=%u)", sent ? "sent" : "skipped",
+                         static_cast<int>(op->error()),
+                         static_cast<unsigned>(op->progressSyncResult().outcome));
+            }
+        }
+        // 详情页状态显示用：最近一次尝试的结果与时刻（含失败）。
+        // / For the detail-page status line: latest attempt result and time (failures included).
+        s_report_has = true;
+        s_report_ok = sent;
+        s_report_epoch = TimeUtils::getCurrentValidTimestamp();
+        // 静默语义：成败只留串口日志，快照回 IDLE，不惊扰状态页。
+        // / Silent semantics: serial logs only; the snapshot returns to IDLE.
+        set_state(WEREAD_IDLE);
     } else {
         set_state(WEREAD_CONNECTING);
         if (connect_online(owned_network) && !s_cancel.load()) {
@@ -375,7 +430,9 @@ extern "C" bool weread_configure(const char* cache, const char* books) {
 }
 static bool dispatch(weread_action_t action, unsigned page, unsigned index,
                      const weread_selection_t* selection, unsigned count,
-                     const char* book_id = nullptr, const char* chapter_uid = nullptr) {
+                     const char* book_id = nullptr, const char* chapter_uid = nullptr,
+                     const uint32_t report_offset = 0, const unsigned report_pct = 0,
+                     const uint32_t report_seconds = 0) {
     if (!initialize() || !s_configured) return false;
     weread_selection_t* queue = nullptr;
     if (action == WEREAD_BATCH) {
@@ -397,6 +454,13 @@ static bool dispatch(weread_action_t action, unsigned page, unsigned index,
          strlen(book_id) >= sizeof(s_book_id) || strlen(chapter_uid) >= sizeof(s_chapter_uid))) {
         heap_caps_free(queue); return false;
     }
+    // 阅读上报必须带书号；seconds=0 合法（详情页手动纯进度同步，官方 enter 包形态）。
+    // / Read reports require a book id; seconds=0 is legal (manual progress-only sync,
+    // / same shape as the official enter packet).
+    if (action == WEREAD_READ_REPORT &&
+        (!book_id || !book_id[0] || strlen(book_id) >= sizeof(s_book_id))) {
+        heap_caps_free(queue); return false;
+    }
     // 整本划线想法路由可带书号（阅读页），也可不带（详情页按索引解析）。
     // / Whole-book notes route takes an optional book id (reader) or resolves by index (detail page).
     if (action == WEREAD_NOTES && book_id && book_id[0] && strlen(book_id) >= sizeof(s_book_id)) {
@@ -410,6 +474,10 @@ static bool dispatch(weread_action_t action, unsigned page, unsigned index,
     if (action == WEREAD_THOUGHTS) {
         snprintf(s_book_id, sizeof(s_book_id), "%s", book_id);
         snprintf(s_chapter_uid, sizeof(s_chapter_uid), "%s", chapter_uid);
+    } else if (action == WEREAD_READ_REPORT) {
+        snprintf(s_book_id, sizeof(s_book_id), "%s", book_id);
+        s_chapter_uid[0] = 0;
+        s_report_offset = report_offset; s_report_pct = report_pct; s_report_seconds = report_seconds;
     } else if (action == WEREAD_NOTES && book_id && book_id[0]) {
         snprintf(s_book_id, sizeof(s_book_id), "%s", book_id);
         s_chapter_uid[0] = 0;
@@ -441,6 +509,22 @@ extern "C" bool weread_start_chapter_reviews(const char* book_id, const char* ch
 extern "C" bool weread_start_notes(const char* book_id) {
     if (!book_id || !book_id[0]) return false;
     return dispatch(WEREAD_NOTES, 0, 0, nullptr, 0, book_id, nullptr);
+}
+// 阅读时长（rt）+进度一次性上报：UploadLocal 无条件上传，官方时长统计的唯一入口。
+// seconds=0 为纯进度同步（详情页手动触发）。
+// / One-shot reading-time (rt) + progress upload via UploadLocal; the only path into
+// / official stats. seconds=0 is a progress-only sync (manual trigger).
+extern "C" bool weread_start_read_report(const char* book_id, uint16_t chapter, uint32_t byte_off,
+                                         uint8_t pct, uint32_t elapsed_seconds) {
+    if (!book_id || !book_id[0]) return false;
+    return dispatch(WEREAD_READ_REPORT, 0, chapter, nullptr, 0, book_id, nullptr, byte_off, pct, elapsed_seconds);
+}
+extern "C" void weread_last_read_report(bool* has, bool* ok, int64_t* epoch) {
+    lock();
+    if (has) *has = s_report_has;
+    if (ok) *ok = s_report_ok;
+    if (epoch) *epoch = s_report_epoch;
+    unlock();
 }
 extern "C" bool weread_start_batch(unsigned page, const weread_selection_t* selection, unsigned count) {
     return dispatch(WEREAD_BATCH, page, 0, selection, count);

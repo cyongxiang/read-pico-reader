@@ -31,6 +31,7 @@ typedef enum {
     WEREAD_BATCH, ///< 串行批量下载 / Sequential batch download
     WEREAD_THOUGHTS, ///< 拉取整本划线想法缓存 / Fetch the whole-book thoughts cache
     WEREAD_NOTES, ///< 按章拉取句子级划线想法（断点续传）/ Per-chapter sentence-level notes fetch
+    WEREAD_READ_REPORT, ///< 上传阅读进度+时长（rt，静默失败）/ Upload progress+reading time (rt, silent)
 } weread_action_t;
 typedef struct {
     char id[64]; ///< 云端书号 / Remote book ID
@@ -75,6 +76,17 @@ bool weread_start_chapter_reviews(const char* book_id, const char* chapter_uid);
 /// / Fetch the whole book's sentence-level notes by book id (full paging, resume);
 /// / called from the reader on a chapter-cache miss.
 bool weread_start_notes(const char* book_id);
+/// 上传一次阅读进度与时长（rt=本次阅读秒数），同步到官方统计；忙时拒绝由调用方稍后重试。
+/// elapsed_seconds=0 为纯进度同步（详情页手动「立即同步」，官方 enter 包同形态，无时长）。
+/// / Upload one progress+reading-time report (rt = seconds read); caller retries when busy.
+/// / elapsed_seconds=0 means progress-only (manual "Sync now"; same shape as the official
+/// / enter packet, no reading time attached).
+bool weread_start_read_report(const char* book_id, uint16_t chapter, uint32_t byte_off,
+                              uint8_t pct, uint32_t elapsed_seconds);
+/// 本次开机内最近一次阅读上报的结果；has=false 表示从未尝试。epoch 为设备秒（时钟无效为 0）。
+/// / Latest read-report attempt this boot; has=false until the first try. epoch is device
+/// / seconds (0 when the clock was invalid at the time).
+void weread_last_read_report(bool* has, bool* ok, int64_t* epoch);
 /// 复制选择后仅启动一个后台任务，逐本下载；失败书不阻塞后续，取消停止整个队列。
 /// Copy selection into one worker; download sequentially, continue after book errors, cancel the whole queue.
 bool weread_start_batch(unsigned page, const weread_selection_t* selection, unsigned count);

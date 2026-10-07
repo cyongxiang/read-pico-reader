@@ -51,8 +51,12 @@ struct ProgressSyncInput {
   uint32_t localTocIndex = 0;
   uint32_t localOffset = 0;
   LocalOffsetBasis localOffsetBasis = LocalOffsetBasis::None;
+  // 本次间隔阅读秒数（rt），随 report 包上报，是官方时长统计的唯一来源。
+  // / Reading seconds for this interval (rt); sent with the report payload, the
+  // / only source the server counts toward official reading time.
+  uint32_t elapsedSeconds = 0;
 };
-static_assert(sizeof(ProgressSyncInput) == 16);
+static_assert(sizeof(ProgressSyncInput) == 20);
 
 enum class ProgressSyncMode : uint8_t {
   Compare,

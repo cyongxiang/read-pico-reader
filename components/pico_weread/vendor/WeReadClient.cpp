@@ -1352,7 +1352,7 @@ bool appendEncodedId(char* out, const size_t outSize, size_t& position, char* wo
 bool appendProgressQuery(char* out, const size_t outSize, char* work, const size_t workSize, const char* bookId,
                          const WeReadStore::TocRecord& chapter, const uint32_t chapterOffset, const uint32_t progress,
                          const uint32_t now, const char* psvts, const char* pclts, const char* token, const bool report,
-                         const uint64_t timestampMs, const uint32_t randomNumber) {
+                         const uint64_t timestampMs, const uint32_t randomNumber, const uint32_t elapsedSeconds) {
   size_t position = 0;
   out[0] = '\0';
   if (!makeWebAppId(work, workSize) || !appendText(out, outSize, position, "appId=") ||
@@ -1377,7 +1377,10 @@ bool appendProgressQuery(char* out, const size_t outSize, char* work, const size
     return false;
   }
   if (report) {
+    // 签名串按字母序拼装（rn < rt < sg）；rt 只出现在 report 包，随包计时长。
+    // / Signature fields are alphabetical (rn < rt < sg); rt rides report packets only.
     if (!appendText(out, outSize, position, "&rn=") || !appendUnsigned(out, outSize, position, randomNumber) ||
+        !appendText(out, outSize, position, "&rt=") || !appendUnsigned(out, outSize, position, elapsedSeconds) ||
         !appendText(out, outSize, position, "&sg=")) {
       return false;
     }
@@ -1397,8 +1400,8 @@ bool appendProgressQuery(char* out, const size_t outSize, char* work, const size
 
 bool makeProgressBody(const char* bookId, const WeReadStore::TocRecord& chapter, const uint32_t chapterOffset,
                       const float localFraction, const char* psvts, const char* pclts, const char* readerToken,
-                      const bool report, char* body, const size_t bodySize, char* work, const size_t workSize,
-                      size_t& written) {
+                      const bool report, const uint32_t elapsedSeconds, char* body, const size_t bodySize, char* work,
+                      const size_t workSize, size_t& written) {
   static constexpr char kDefaultReaderToken[] = "3c5c8717f3daf09iop3423zafeqoi";
   const uint32_t now = TimeUtils::getCurrentValidTimestamp();
   if (now == 0 || !isSafeProtocolToken(bookId) || !isSafeProtocolToken(chapter.chapterUid) ||
@@ -1414,7 +1417,7 @@ bool makeProgressBody(const char* bookId, const WeReadStore::TocRecord& chapter,
       report ? static_cast<uint64_t>(now) * 1000ULL + static_cast<uint32_t>(random(0, 1000)) : 0;
 
   if (!appendProgressQuery(body, bodySize, work, workSize, bookId, chapter, chapterOffset, progress, now, psvts, pclts,
-                           token, report, timestampMs, randomNumber)) {
+                           token, report, timestampMs, randomNumber, elapsedSeconds)) {
     return false;
   }
   char signature[24];
@@ -1448,7 +1451,8 @@ bool makeProgressBody(const char* bookId, const WeReadStore::TocRecord& chapter,
   if (!appendText(body, bodySize, position, "\"")) return false;
   if (report) {
     if (!appendText(body, bodySize, position, ",\"ts\":") || !appendUnsigned(body, bodySize, position, timestampMs) ||
-        !appendText(body, bodySize, position, ",\"rn\":") || !appendUnsigned(body, bodySize, position, randomNumber)) {
+        !appendText(body, bodySize, position, ",\"rn\":") || !appendUnsigned(body, bodySize, position, randomNumber) ||
+        !appendText(body, bodySize, position, ",\"rt\":") || !appendUnsigned(body, bodySize, position, elapsedSeconds)) {
       return false;
     }
     const int sourceLength = snprintf(work, workSize, "%llu%u%s", static_cast<unsigned long long>(timestampMs),
@@ -2968,8 +2972,8 @@ Error Operation::fetchProgressReaderOnce() {
 Error Operation::sendProgressOnce(const bool report) {
   size_t bodySize = 0;
   if (!makeProgressBody(book_.bookId, chapter_, progressChapterOffset_, progressSyncInput_.localFraction, psvts_,
-                        imageHost_, previousVid_, report, reinterpret_cast<char*>(ioBuffer_), sizeof(ioBuffer_), url_,
-                        sizeof(url_), bodySize)) {
+                        imageHost_, previousVid_, report, progressSyncInput_.elapsedSeconds,
+                        reinterpret_cast<char*>(ioBuffer_), sizeof(ioBuffer_), url_, sizeof(url_), bodySize)) {
     return Error::Clock;
   }
   SimpleJsonContext context;

@@ -2343,6 +2343,10 @@ static void track_ticket_stats(app_ctx_t* ctx) {
         uint32_t elapsed = (uint32_t)(ctx->now_ms - s_stats_last_ms);
         s_stats_pending_ms += elapsed;
         s_session_read_ms += elapsed;
+        // 微信读书阅读时长（rt）同步走同一活动判定；非微信读书书内部直返。
+        // / WeRead reading-time (rt) sync rides the same activity gate; no-op for other books.
+        book_notes_report_tick(elapsed, (uint16_t)s_chapter,
+                               (uint32_t)reader_page_offset(s_page), (uint8_t)percent(s_page));
     }
     s_stats_last_ms = ctx->now_ms;
     if (s_stats_pending_ms >= 30000) flush_ticket_stats();
@@ -3144,6 +3148,10 @@ static app_redraw_t resize_text(app_ctx_t* ctx, int dir) {
     s_px = next;
     s_page = book_layout_page_for_offset(off);
     unlock_draw();
+    // 字号重排后行位置全变，装饰缓存须作废重算，否则划线消失。
+    // / Reflow invalidates line rects; reload decorations or marks vanish.
+    book_notes_invalidate();
+    book_notes_set_chapter(s_chapter);
     app_settings_set_book_px(s_px);
     save_progress();
     return paint_reading(ctx, MODE_DU);
@@ -3178,6 +3186,10 @@ static app_redraw_t apply_reader_layout(app_ctx_t* ctx, int next_px, int next_ma
     }
     unlock_draw();
     if (!ok) return APP_REDRAW_NONE;
+    // 版式重排后行位置全变，装饰缓存须作废重算，否则划线消失。
+    // / Reflow invalidates line rects; reload decorations or marks vanish.
+    book_notes_invalidate();
+    book_notes_set_chapter(s_chapter);
     app_settings_set_book_px((uint8_t)s_px);
     app_settings_set_book_margin((uint8_t)s_margin);
     app_settings_set_book_line_spacing(next_line);
@@ -3205,6 +3217,10 @@ static app_redraw_t apply_reader_typography(app_ctx_t* ctx, int tracking_index) 
     }
     unlock_draw();
     if (!ok) return APP_REDRAW_NONE;
+    // 字距重排后行位置全变，装饰缓存须作废重算，否则划线消失。
+    // / Tracking reflow invalidates line rects; reload decorations or marks vanish.
+    book_notes_invalidate();
+    book_notes_set_chapter(s_chapter);
     app_settings_set_book_tracking((uint8_t)tracking_index);
     save_progress();
     return APP_REDRAW_PAGE;
@@ -3227,6 +3243,10 @@ static app_redraw_t apply_reader_indent(app_ctx_t* ctx, int em) {
     }
     unlock_draw();
     if (!ok) return APP_REDRAW_NONE;
+    // 缩进重排后行位置全变，装饰缓存须作废重算，否则划线消失。
+    // / Indent reflow invalidates line rects; reload decorations or marks vanish.
+    book_notes_invalidate();
+    book_notes_set_chapter(s_chapter);
     app_settings_set_book_indent((uint8_t)em);
     save_progress();
     return APP_REDRAW_PAGE;
@@ -3329,6 +3349,12 @@ static app_redraw_t select_reading_font_item(app_ctx_t* ctx, const ttf_font_item
     }
     unlock_draw();
     if (!ok) return APP_REDRAW_NONE;
+    // 字体切换重排后排版行全部变化，装饰命中缓存必须按新行重算：
+    // set_chapter 对同章短路，必须先作废缓存再补跑（否则划线消失）。
+    // / A font switch rebuilds every layout line; set_chapter short-circuits
+    // / on the same spine, so poison the cache first or highlights vanish.
+    book_notes_invalidate();
+    book_notes_set_chapter(s_chapter);
     app_settings_set_font_path(item->path);
     copy_text(s_font_path, sizeof(s_font_path), item->path);
     save_progress();
