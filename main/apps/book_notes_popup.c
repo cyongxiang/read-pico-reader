@@ -2,15 +2,19 @@
  * SPDX-FileCopyrightText: 2026 mindreset
  * SPDX-License-Identifier: Apache-2.0
  * 点划线句子弹想法：居中浮层，想法全文直出（作者小字在上、♥赞数行尾、正文
- * 几行排几行），本页装不下的整条自动移下一页，超页长文独占一页末行省略；
- * 一页排几条排几条，末页自然留白，横线分隔无卡片框。
- * 弹窗秒开：SD 流式游标 + 惰性续读，翻页增量加载；末页再翻 = 读完即收起。
- * 物理键 1/3 翻页、2 关闭；点 X/弹窗外关闭。
+ * 几行排几行）。官方式连续流式排版——每条从当前位置接着排，排满即断、下页
+ * 从断行续（不重复作者行），后续想法按顺序跟着往后，如同读书。开窗时 SD
+ * 顺序全量读入 + 预排版一次算死页表：页码恒定不跳，超长文必完整续排。
+ * 页尾零星空白按比例均分到本页各条间隙（渲染层，页码不受影响），内容
+ * 顶到页底，如同书籍排版。
+ * 物理键 1/3 翻页、2 关闭；点 X/弹窗外关闭；末页再翻 = 读完即收起。
  * / Tap-a-highlight popup: centered sheet showing each thought in full — small
- * / author line (heart+likes right-aligned) above the whole body; a thought
- * / that cannot fit moves whole to the next page, page-tall ones stand alone.
- * / Opens instantly via an SD streaming cursor with lazy incremental reads;
- * / flipping past the last page closes the sheet.
+ * / author line (heart+likes right-aligned) above the body. Official-style
+ * / continuous flow: a thought fills the page and splits onto the next (the
+ * / author line is not repeated), later rows follow in order, like reading.
+ * / On open the thoughts are read in one sequential SD pass and the page table
+ * / is precomputed once — page numbers stay fixed and long texts always finish.
+ * / Keys 1/3 page, 2 closes; tap X or outside closes; past the last page closes.
  */
 #include "book_notes_popup.h"
 
@@ -43,12 +47,15 @@ static const char* NOTES_TAG = "book_notes";
 #define NOTES_SHEET_X 24
 #define NOTES_SHEET_W 636
 #define NOTES_SHEET_BOTTOM 972
-#define NOTES_MAX_ROWS 16   ///< 单页热区上限（自适应后极端小字号下的保险）。/ Row-rect cap.
-#define NOTES_MAX_PAGES 96  ///< 页起点上限（单句 200 条 / 每页至少 3 条）。/ Page-start cap.
+// 预排版页上限：单句 200 条上限 × 每条最长约 13 行（content cap 512B ÷ 每行
+// 约 40px×14 字）÷ 每页至少约 10 行正文 ≈ 260 页，取 400 留裕量。页表在
+// PSRAM 堆上按需分配，不占内部 BSS。
+// / Page-table cap: 200 thoughts × ≤13 lines each ≈ 260 pages worst case; 400
+// / with margin. The table lives in PSRAM heap, not internal BSS.
+#define NOTES_MAX_PAGES 400
 #define NOTES_BODY_PX 38
 #define NOTES_META_PX 22
 #define NOTES_HL_PX 28
-#define NOTES_LINE_CAP 512
 #define NOTES_LIST_X 48
 #define NOTES_LIST_W 588
 #define NOTES_LIST_TOP 302
@@ -58,17 +65,33 @@ static const char* NOTES_TAG = "book_notes";
 static struct {
     bool open;
     weread_highlight_t hit;        ///< 命中的划线（含章内序号）。/ Matched highlight.
-    weread_note_t* notes;          ///< PSRAM，已载入想法快照。/ PSRAM thoughts loaded so far.
+    weread_note_t* notes;          ///< PSRAM，弹窗期全量想法。/ PSRAM, all thoughts for this tap.
     bool owned;                    ///< notes 归弹窗所有（false = 引用章快照）。/ Owned vs borrowed notes.
-    weread_notes_cursor_t* cursor; ///< SD 流式游标，翻页续读。/ SD cursor for lazy paging.
     unsigned capacity;             ///< notes 已分配条数。/ Allocated slots.
-    unsigned loaded;               ///< 已从游标读出的条数。/ Thoughts pulled from the cursor.
+    unsigned loaded;               ///< 已读入条数。/ Thoughts read from SD.
     unsigned count;
     unsigned page;                 ///< 当前页（0 基）。/ Current page, zero based.
-    unsigned pages;                ///< 已知页数下界（自适应排版逐步确定）。/ Known page lower bound.
-    unsigned page_start[NOTES_MAX_PAGES]; ///< 每页起始条下标。/ First row index of each page.
-    unsigned rows_used[NOTES_MAX_PAGES];  ///< 每页实际渲染条数（渲染时记录）。/ Rows actually laid out per page.
+    unsigned pages;                ///< 总页数（预排版一次算死，页码恒定）。/ Exact total from prelayout.
+    unsigned* tbl;                 ///< PSRAM 页表：每页 [起点条, 起点行, 末条, 末条结束行]。/ PSRAM page table.
 } s_notes;
+
+// 页表五元组存取（第五列=本页内容底部 y，供渲染均分页尾空白）。/ Page-table
+// accessors (5th column = content bottom y, feeds render-time justification).
+#define TBL_PS(p) s_notes.tbl[p]
+#define TBL_PL(p) s_notes.tbl[NOTES_MAX_PAGES + (p)]
+#define TBL_EI(p) s_notes.tbl[2 * NOTES_MAX_PAGES + (p)]
+#define TBL_EL(p) s_notes.tbl[3 * NOTES_MAX_PAGES + (p)]
+#define TBL_Y(p) s_notes.tbl[4 * NOTES_MAX_PAGES + (p)]
+
+// 排版度量（渲染与预排版共用同一组值，保证两处判定一致；弹窗打开期间
+// 字体设置被手势拦截，不会中途变化）。
+// / Shared layout metrics for both render and prelayout (identical math); the
+// / sheet blocks settings gestures, so fonts cannot change mid-open.
+static void popup_metrics(int* body_step, int* meta_step, int* list_bottom) {
+    *body_step = ui_text_effective_px(NOTES_BODY_PX) + 10;
+    *meta_step = ui_text_effective_px(NOTES_META_PX);
+    *list_bottom = NOTES_PAGER_Y - 8;
+}
 
 // 弹窗文本统一强制走阅读 TTF 字体：ui_text 会优先用内置位图字库、缺字才落 TTF，
 // 导致弹窗内位图黑体与阅读字体（如仓耳今楷）混排；以下包装与 ui_text 系行为
@@ -92,6 +115,35 @@ static void notes_draw_text_vc(uint8_t* fb, int x, int center_y, int px, const c
     int above = 0, below = 0;
     ttf_measure_line_px(eff, s, &above, &below);
     notes_draw_text(fb, x, center_y + (above - below) / 2, px, s, align, inverted);
+}
+
+// 贪心折行断点：逐字测宽累加，返回宽度放不下之前的字节断点（不超 max_keep）。
+// 测量（popup_measure）与绘制（popup_paragraph）共用本函数，断行必然一致；
+// 每字只量一次小串，替代旧版整串反复回退测量，复杂度 O(N²)→O(N)，弹窗秒开。
+// / Greedy wrap point: accumulate per-char widths and return the byte offset
+// / where the width runs out (capped at max_keep). Shared by measuring and
+// / drawing so line breaks are always identical; one tiny measure per char
+// / replaces the old re-measure-the-whole-string loop, O(N²)→O(N).
+static size_t popup_break_at(int px, const char* s, int width, size_t max_keep) {
+    const int eff = ui_text_effective_px(px);
+    int acc = 0;
+    size_t keep = 0;
+    const size_t n = strnlen(s, max_keep);
+    while (keep < n) {
+        const unsigned char c = (unsigned char)s[keep];
+        int len = 1;
+        if (c >= 0xf0) len = 4;
+        else if (c >= 0xe0) len = 3;
+        else if (c >= 0xc0) len = 2;
+        char one[8];
+        int m = 0;
+        while (m < len && keep + (size_t)m < n) one[m] = s[keep + (size_t)m], ++m;
+        one[m] = 0;
+        acc += notes_text_width(eff, one);
+        if (acc > width) break;
+        keep += (size_t)m;
+    }
+    return keep;
 }
 
 // 单行截断与折行绘制辅助；测量必须过 ui_text_effective_px 与绘制同源。
@@ -123,44 +175,42 @@ static void popup_fit(char* dst, size_t cap, const char* src, int px, int width)
     }
 }
 
-// 按像素宽折行绘制，超出行数在末行截断并加省略号；行高与测量都用 effective 字号，
-// 调用方传入可改写副本（容量需比原文多 4 字节，留给末行省略号）。
-// / Wrap by pixel width with an ellipsis on the clipped last line; line height and
-// / measuring use the effective px. Caller passes a mutable copy with 4 spare bytes.
-static int popup_paragraph(uint8_t* fb, int x, int y, int width, int px, char* text, int lines) {
+// 按像素宽折行绘制：skip 跳过前若干行（超长文跨页续排时从断行继续），
+// tail_ellipsis=true 时超出行数在末行截断加省略号（划线引用句用）；
+// 想法正文续排时 tail_ellipsis=false，画满行数即止、绝不加省略号（剩余行在后续页）。
+// 行高与测量都用 effective 字号，调用方传入可改写副本（容量需比原文多 4 字节）。
+// / Wrap by pixel width: `skip` resumes after a page split, `tail_ellipsis` adds
+// / an ellipsis on the clipped last line (highlight quote). Thought bodies pass
+// / tail_ellipsis=false when continuing across pages — draw the lines and stop.
+// / Line height and measuring use the effective px; caller passes a mutable copy
+// / with 4 spare bytes.
+static int popup_paragraph(uint8_t* fb, int x, int y, int width, int px, char* text, int lines,
+                           int skip, bool tail_ellipsis) {
     const int eff = ui_text_effective_px(px);
     const int step = eff + 10;
     int drawn = 0;
     char* cursor = text;
+    // 续排：先空折 skip 行定位断点（不绘制）。/ Resume: fold skip lines without drawing.
+    for (int row = 0; row < skip && cursor[0]; ++row) {
+        const size_t keep = popup_break_at(px, cursor, width, strlen(cursor));
+        if (!keep) break;
+        cursor += keep;
+        while (*cursor == ' ') ++cursor;
+    }
     for (int row = 0; row < lines && cursor[0]; ++row) {
         const int top = y + row * step;
-        size_t keep = strlen(cursor);
-        while (keep) {
-            const char saved = cursor[keep];
-            cursor[keep] = 0;
-            const int w = notes_text_width(eff, cursor);
-            cursor[keep] = saved;
-            if (w <= width) break;
-            --keep;
-            while (keep && ((unsigned char)cursor[keep] & 0xc0) == 0x80) --keep;
-        }
+        const size_t keep = popup_break_at(px, cursor, width, strlen(cursor));
         if (!keep) break;
-        const char* rest = cursor + keep;
-        while (*rest == ' ') ++rest;
         if (row == lines - 1) {
-            // 末行：还有剩余内容则收窄并补省略号。/ Last line: shrink and ellipsize if more remains.
-            if (*rest) {
+            // 末行：引用句收窄补省略号；跨页续排则直接截断（剩余在下一页）。
+            // / Last line: ellipsize for the quote; a page-split body just clips.
+            const char* rest = cursor + keep;
+            while (*rest == ' ') ++rest;
+            if (tail_ellipsis && *rest) {
                 const int ell_w = notes_text_width(eff, "…");
-                while (keep) {
-                    const char saved = cursor[keep];
-                    cursor[keep] = 0;
-                    const int w = notes_text_width(eff, cursor);
-                    cursor[keep] = saved;
-                    if (w + ell_w + 4 <= width) break;
-                    --keep;
-                    while (keep && ((unsigned char)cursor[keep] & 0xc0) == 0x80) --keep;
-                }
-                memcpy(cursor + keep, "…", 4);
+                size_t k2 = popup_break_at(px, cursor, width - ell_w - 4, keep);
+                if (!k2) k2 = keep;  // 极窄兜底 / degenerate-width fallback
+                memcpy(cursor + k2, "…", 4);
             } else {
                 cursor[keep] = 0;
             }
@@ -181,40 +231,103 @@ static int popup_paragraph(uint8_t* fb, int x, int y, int width, int px, char* t
 
 static void popup_reset(void) {
     if (s_notes.owned) heap_caps_free(s_notes.notes);
-    weread_notes_cursor_close(s_notes.cursor);
+    heap_caps_free(s_notes.tbl);
     s_notes.notes = NULL;
-    s_notes.cursor = NULL;
+    s_notes.tbl = NULL;
     s_notes.count = s_notes.page = 0;
     s_notes.pages = 1;
-    memset(s_notes.page_start, 0, sizeof(s_notes.page_start));
-    memset(s_notes.rows_used, 0, sizeof(s_notes.rows_used));
     s_notes.capacity = s_notes.loaded = 0;
     s_notes.open = false;
     s_notes.owned = false;
 }
 
-// 惰性加载：把想法从 SD 游标续读到目标条数（翻页只读增量，每条一次寻道）。
-// / Lazy load: pull thoughts from the SD cursor up to the target count; paging
-// / reads only the increment with one seek per thought.
-static void notes_load(unsigned upto) {
-    if (!s_notes.cursor) return;
-    if (upto > s_notes.count) upto = s_notes.count;
-    while (s_notes.loaded < upto) {
-        if (s_notes.loaded == s_notes.capacity) {
-            const unsigned cap = s_notes.capacity ? s_notes.capacity * 2 : 8;
-            weread_note_t* next = (weread_note_t*)heap_caps_realloc(
-                s_notes.notes, cap * sizeof(*next), MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
-            if (!next) return;
-            s_notes.notes = next;
-            s_notes.capacity = cap;
-        }
-        if (!weread_notes_cursor_next(s_notes.cursor, &s_notes.notes[s_notes.loaded])) {
-            // 服务器计数超出实际数据：按实载截断。/ Trust data over the count.
-            s_notes.count = s_notes.loaded;
-            return;
-        }
-        ++s_notes.loaded;
+// ---- 预排版：开窗时一次成型。 ----
+// ---- Prelayout: the whole page table is computed once on open. ----
+
+// 按像素宽测量折行行数（与 popup_paragraph 共用 popup_break_at，断行必然一致）。
+// / Count wrapped lines via the shared wrap point; identical breaks to the renderer.
+static int popup_measure(int width, int px, const char* text, int max_lines) {
+    int drawn = 0;
+    const char* cursor = text;
+    for (int row = 0; row < max_lines && cursor[0]; ++row) {
+        const size_t keep = popup_break_at(px, cursor, width, strlen(cursor));
+        if (!keep) break;
+        ++drawn;
+        cursor += keep;
+        while (*cursor == ' ') ++cursor;
     }
+    return drawn;
+}
+
+// 逐条测量折行行数（与 popup_paragraph 同源贪心折行，判定必然一致）。
+// / Measure wrapped line count per thought (same greedy wrap as the renderer).
+static unsigned* popup_measure_lines(unsigned count) {
+    unsigned* lines = (unsigned*)heap_caps_calloc(count, sizeof(unsigned),
+                                                  MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+    if (!lines) return NULL;
+    for (unsigned i = 0; i < count; ++i) {
+        lines[i] = (unsigned)popup_measure(NOTES_LIST_W, NOTES_BODY_PX,
+                                           s_notes.notes[i].content, 64);
+        if (!lines[i]) lines[i] = 1;  // 空文保底 1 行，防排版死循环。/ Keep empties moving.
+    }
+    return lines;
+}
+
+// 一次性算出全部页边界（官方式连续流式排版）：每条从当前位置接着排，排满
+// 即断、下页从断行续（不重复作者行）；后续想法按顺序跟着往后，如同读书。
+// 页中段放不下也不再「整条移页」——那会留大片空白并让页数虚高。页表记录
+// 每页 [起点条, 起点行, 末条, 末条结束行]，渲染照表直画，页码从此恒定。
+// / Compute every page boundary in one pass (official-style continuous flow):
+// / each thought continues from the current position, fills the page and splits
+// / to the next; later thoughts follow in order. No whole-row moves — they
+// / leave big gaps and inflate the page count. The table stores per page
+// / [start row, start line, last row, last row's end line]; the renderer just
+// / paints from the table, so page numbers never change.
+static bool popup_prelay(const unsigned* lines, unsigned count) {
+    int body_step = 0, meta_step = 0, list_bottom = 0;
+    popup_metrics(&body_step, &meta_step, &list_bottom);
+    const int list_top = NOTES_LIST_TOP;
+    unsigned page = 0, i = 0, line_off = 0;
+    int y = list_top;
+    TBL_PS(0) = 0;
+    TBL_PL(0) = 0;
+    while (i < count) {
+        const int body_top = y + (line_off ? 0 : meta_step + 6);
+        const int fit = (list_bottom - 8 - body_top) / body_step;
+        if (fit < 1) {
+            // 页尾塞不下作者行+1 行（或续排条 1 行）：开新页接着排同一条。
+            // / Page tail cannot hold the author line plus a line: flow on.
+            if (++page >= NOTES_MAX_PAGES) return false;  // 极端防护 / extreme guard
+            TBL_PS(page) = i;
+            TBL_PL(page) = line_off;
+            y = list_top;
+            continue;
+        }
+        const unsigned remain = lines[i] - line_off;
+        if (remain <= (unsigned)fit) {
+            // 整条（或续排尾巴）放下：本页末条 = i。
+            // / Fits whole: this page ends with this thought.
+            TBL_EI(page) = i;
+            TBL_EL(page) = lines[i];
+            TBL_Y(page) = body_top + (int)remain * body_step;  // 内容底（不含分隔线）
+            y = TBL_Y(page) + 18;  // 分隔线 + 间距 / divider + gap
+            ++i;
+            line_off = 0;
+        } else {
+            // 排满本页即断，剩余行从下页页首继续。
+            // / Fill the page and split; the rest resumes at the next page top.
+            TBL_EI(page) = i;
+            TBL_EL(page) = line_off + (unsigned)fit;
+            TBL_Y(page) = body_top + (int)fit * body_step;
+            line_off += (unsigned)fit;
+            if (++page >= NOTES_MAX_PAGES) return false;
+            TBL_PS(page) = i;
+            TBL_PL(page) = line_off;
+            y = list_top;
+        }
+    }
+    s_notes.pages = page + 1;
+    return true;
 }
 
 // ---- 句子级划线想法缓存（underlines + readReviews 全量落盘）：随章切换加载。 ----
@@ -582,63 +695,78 @@ bool book_notes_tap_mark(uint32_t spine, int mark) {
     if (src >= s_browse.count) return false;
     const unsigned ordinal = s_browse.ords[src];
     popup_reset();
-    // 秒开关键：只打开游标并预载第一页，几十上百条的长句不再一次性全读
-    // （旧行为 O(N²) 寻道要卡数秒）；翻页时由 notes_load 按页续读。
-    // / Instant open: open the cursor and preload only the first page; long lists
-    // / no longer read everything upfront. Later pages pull incrementally.
+    // 全量顺序读：SD 游标单链逐条恰好一次寻道（无旧版 O(N²) 重扫），一次
+    // 扫完该句全部想法，随后预排版一次算死页表——页码恒定、超长文必续排，
+    // 根治动态估算页数越翻越变、三分支排版丢尾的两处顽疾。200 条上限 +
+    // 顺序 IO + PSRAM，实测耗时可忽略（EPD 一次刷新即掩盖）。
+    // / Read every thought for this sentence in one sequential SD pass (the
+    // / cursor's linked list needs no rescans), then prelayout the page table
+    // / once: page numbers stay fixed and long thoughts always continue, fixing
+    // / both the drifting estimate and the lost-tail bugs.
     unsigned total = 0;
     weread_notes_cursor_t* cursor = weread_notes_cursor_open(s_dec.spine, ordinal, &total);
     if (!cursor || !total) {
         weread_notes_cursor_close(cursor);
         return false;
     }
-    s_notes.cursor = cursor;
+    while (s_notes.loaded < total) {
+        if (s_notes.loaded == s_notes.capacity) {
+            const unsigned cap = s_notes.capacity ? s_notes.capacity * 2 : 16;
+            weread_note_t* next = (weread_note_t*)heap_caps_realloc(
+                s_notes.notes, cap * sizeof(*next), MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+            if (!next) break;
+            s_notes.notes = next;
+            s_notes.capacity = cap;
+        }
+        if (!weread_notes_cursor_next(cursor, &s_notes.notes[s_notes.loaded])) {
+            total = s_notes.loaded;  // 服务器计数超出实际：按实载截断。/ Trust data over count.
+            break;
+        }
+        if (!s_notes.notes[s_notes.loaded].content[0]) continue;  // 空想法不入列（防隐形占位）。/ Drop empties.
+        ++s_notes.loaded;
+    }
+    weread_notes_cursor_close(cursor);
     s_notes.count = total;
-    s_notes.pages = 1;  // 自适应分页：页数随排版逐步确定。/ Pages grow as rows are laid out.
     s_notes.page = 0;
     s_notes.owned = true;
-    notes_load(NOTES_MAX_ROWS);  // 首页按最大行数预载，不够渲染时再补。/ Preload, top up while rendering.
     if (!s_notes.loaded || !weread_notes_highlight_at(s_dec.spine, ordinal, &s_notes.hit)) {
         popup_reset();
         return false;
     }
+    // 页表：测量每条行数 → 一次排版。分配失败则拒绝弹窗（不白屏）。
+    // / Page table: measure rows, lay out once. Fail closed on OOM.
+    s_notes.tbl = (unsigned*)heap_caps_calloc(5 * NOTES_MAX_PAGES, sizeof(unsigned),
+                                              MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+    unsigned* lines = s_notes.tbl ? popup_measure_lines(s_notes.count) : NULL;
+    if (!lines || !popup_prelay(lines, s_notes.count)) {
+        heap_caps_free(lines);
+        popup_reset();
+        return false;
+    }
+    heap_caps_free(lines);
     s_notes.open = true;
-    ESP_LOGI(NOTES_TAG, "tap mark%d -> highlight %u: %u thought(s) '%.40s'",
-             mark, ordinal, s_notes.count, s_notes.hit.text);
+    ESP_LOGI(NOTES_TAG, "tap mark%d -> highlight %u: %u thought(s), %u page(s) '%.40s'",
+             mark, ordinal, s_notes.count, s_notes.pages, s_notes.hit.text);
     return true;
 }
 
-// 自适应翻页：页边界由渲染时的实际排版确定（page_start/rows_used）。
-// 向后翻：下一页起点 = 本页起点 + 本页实排条数；向前翻：回退到已记录的页起点。
-// / Adaptive paging: boundaries come from the recorded layout. Forward starts at
-// / start+rows_used; backward jumps to the previously recorded page start.
+// 翻页：页表预排版一次算死，这里只做下标移动与末页收起判定，页码恒定。
+// / Paging: with the precomputed table this is pure index movement; past the
+// / last page closes the sheet.
 static bool popup_flip(int dir) {
     if (dir < 0) {
         if (!s_notes.page) return false;
         --s_notes.page;
-        notes_load(s_notes.page_start[s_notes.page] + NOTES_MAX_ROWS);
         return true;
     }
-    const unsigned cur = s_notes.page;
-    if (cur + 1 >= NOTES_MAX_PAGES) return false;
-    if (!s_notes.rows_used[cur]) return false;  // 未渲染过本页，边界未知。/ Layout unknown yet.
-    const unsigned next_start = s_notes.page_start[cur] + s_notes.rows_used[cur];
-    if (next_start >= s_notes.count) {
+    if (s_notes.page + 1 >= s_notes.pages) {
         // 末页再翻 = 想法读完：直接收起弹窗回到正文（返回 true 触发重绘还原）。
         // / Flipping past the last page means the list is finished: close the
         // / sheet and return true so the repaint restores the body text.
         popup_reset();
         return true;
     }
-    // 页起点必须每次翻页都记录：渲染期的页数是估算值（只增不减），估算膨胀后
-    // cur+1 < pages 恒成立，若只在扩张分支写 page_start，下一页起点会停在 0，
-    // 翻页又回到本页。/ The boundary must be recorded on every flip: render
-    // inflates `pages` as an estimate, so the growth branch stops firing and the
-    // next-page start would stay 0, replaying the same page.
-    s_notes.page_start[cur + 1] = next_start;
-    if (cur + 1 >= s_notes.pages) s_notes.pages = cur + 2;
-    s_notes.page = cur + 1;
-    notes_load(next_start + NOTES_MAX_ROWS);
+    ++s_notes.page;
     return true;
 }
 
@@ -729,31 +857,6 @@ static void popup_meta(uint8_t* fb, int x, int y, const char* author, unsigned l
     notes_draw_text(fb, hx + 13, y, NOTES_META_PX, num, EPD_DRAW_ALIGN_LEFT, false);
 }
 
-// 按像素宽测量折行行数（与 popup_paragraph 同源折行算法，不绘制不改写文本）。
-// / Count wrapped lines with the same algorithm as popup_paragraph; no drawing.
-static int popup_measure(int width, int px, char* text, int max_lines) {
-    const int eff = ui_text_effective_px(px);
-    int drawn = 0;
-    char* cursor = text;
-    for (int row = 0; row < max_lines && cursor[0]; ++row) {
-        size_t keep = strlen(cursor);
-        while (keep) {
-            const char saved = cursor[keep];
-            cursor[keep] = 0;
-            const int w = notes_text_width(eff, cursor);
-            cursor[keep] = saved;
-            if (w <= width) break;
-            --keep;
-            while (keep && ((unsigned char)cursor[keep] & 0xc0) == 0x80) --keep;
-        }
-        if (!keep) break;
-        ++drawn;
-        cursor += keep;
-        while (*cursor == ' ') ++cursor;
-    }
-    return drawn;
-}
-
 void book_notes_render(uint8_t* fb) {
     if (!s_notes.open) return;
     // 居中浮层：圆角白底 + 细边，不再贴屏底（下方正文带可见可点）。
@@ -775,61 +878,68 @@ void book_notes_render(uint8_t* fb) {
     // / The highlighted sentence (quote), up to two lines, then a divider.
     char hl[WEREAD_NOTE_TEXT_CAP + 8];
     snprintf(hl, sizeof(hl), "%s", s_notes.hit.text);
-    popup_paragraph(fb, NOTES_LIST_X, NOTES_SHEET_TOP + 88, NOTES_LIST_W, NOTES_HL_PX, hl, 2);
+    popup_paragraph(fb, NOTES_LIST_X, NOTES_SHEET_TOP + 88, NOTES_LIST_W, NOTES_HL_PX, hl, 2, 0, true);
     popup_hline(fb, NOTES_LIST_X, NOTES_LIST_X + NOTES_LIST_W, 284);
-    // 想法列表（全文直出，无 2 行截断、无详情跳转）：每条 = 作者小字行（♥右对齐）
-    // + 正文全文（几行排几行）。本页剩余高度装不下整条时整条移到下一页；首条就
-    // 超过一页高的极端长文独占本页、末行省略号兜底。排到分页栏上沿为止，内容多
-    // 则页满，末页自然留白，不固定条数；不足时现场续读游标。
-    // / Thoughts are shown in full — no 2-line cap, no detail hop: author line
-    // / (heart right) then the whole body. A thought that cannot fit the page
-    // / remainder moves whole to the next page; one taller than an entire page
-    // / takes the page alone with an ellipsis tail. Rows flow until the pager.
-    const int body_step = ui_text_effective_px(NOTES_BODY_PX) + 10;
-    const int meta_step = ui_text_effective_px(NOTES_META_PX);
-    const int list_bottom = NOTES_PAGER_Y - 8;
+    // 想法列表（全文直出）：照预排版页表直画。官方式连续流式——每条从当前
+    // 位置接着排，排满即断、下页从断行续（不重复作者行），后续想法按顺序
+    // 跟着往后，如同读书；页码由预排版算死，恒定不跳。
+    // / Thoughts in full, painted straight from the precomputed table: official-
+    // / style continuous flow — each thought fills the page, splits to the next
+    // / (author line not repeated), later ones follow in order; page numbers are
+    // / fixed at open time.
+    int body_step = 0, meta_step = 0, list_bottom = 0;
+    popup_metrics(&body_step, &meta_step, &list_bottom);
+    // 页尾空白均分：把本页剩余空间按比例分摊到条与条的分隔间隙，内容顶到
+    // 页底（如同书籍排版）。页边界仍由页表决定，均分只发生在渲染层，页码
+    // 恒定不受影响。/ Justify: spread the page's leftover over its divider
+    // / gaps so content reaches the page bottom, like a book. Page boundaries
+    // / stay table-fixed; justification is render-only, page numbers untouched.
+    const int leftover = (list_bottom - 8) - (int)TBL_Y(s_notes.page);
+    const unsigned end_i = TBL_EI(s_notes.page);
+    const unsigned n_gaps = end_i - TBL_PS(s_notes.page);  // 间隙数 = 本页条数-1
     int y = NOTES_LIST_TOP;
-    unsigned i = s_notes.page_start[s_notes.page];
-    unsigned k = 0;
-    while (i < s_notes.count && k < NOTES_MAX_ROWS) {
-        if (i >= s_notes.loaded) {
-            notes_load(i + 1);  // 渲染中续读。/ Top up mid-layout.
-            if (i >= s_notes.loaded) break;  // 数据到底。/ End of data.
-        }
+    unsigned i = TBL_PS(s_notes.page);
+    unsigned line_off = TBL_PL(s_notes.page);
+    while (i < s_notes.count) {
+        if (i >= s_notes.loaded) break;  // 页表保证数据已全量在内存。/ Table implies fully loaded.
         char body[WEREAD_NOTE_CONTENT_CAP + 8];
         snprintf(body, sizeof(body), "%s", s_notes.notes[i].content);
-        int lines = popup_measure(NOTES_LIST_W, NOTES_BODY_PX, body, 64);  // 全文测量。/ Full measure.
-        int divider = y + meta_step + 6 + lines * body_step + 8;
-        if (divider > list_bottom) {
-            if (k) break;  // 装不下整条 → 移下一页。/ Move whole to the next page.
-            // 首条超页：独占本页，末行省略号。/ Taller than a page: page alone.
-            lines = (list_bottom - y - meta_step - 14) / body_step;
-            if (lines < 1) lines = 1;
-            divider = y + meta_step + 6 + lines * body_step + 8;
+        const int body_top = y + (line_off ? 0 : meta_step + 6);
+        if (!line_off)
+            popup_meta(fb, NOTES_LIST_X, y, s_notes.notes[i].author, s_notes.notes[i].likes);
+        if (i == end_i) {
+            // 本页末条：画到页表记录的结束行（断条续排或恰好排完），不再画线。
+            // / Last row of this page: paint to the recorded end line, no divider.
+            const int drawn = popup_paragraph(fb, NOTES_LIST_X, body_top, NOTES_LIST_W,
+                                              NOTES_BODY_PX, body,
+                                              (int)(TBL_EL(s_notes.page) - line_off),
+                                              (int)line_off, false);
+            y = body_top + drawn * body_step;
+            break;
         }
-        popup_meta(fb, NOTES_LIST_X, y, s_notes.notes[i].author, s_notes.notes[i].likes);
-        popup_paragraph(fb, NOTES_LIST_X, y + meta_step + 6, NOTES_LIST_W, NOTES_BODY_PX,
-                        body, lines);
-        popup_hline(fb, NOTES_LIST_X, NOTES_LIST_X + NOTES_LIST_W, divider);
-        y = divider + 10;
-        ++k;
+        // 中间条：自然画完（页表保证放得下），画分隔线接着排下一条。
+        // / Middle row: paints whole (the table guarantees it fits), then divider.
+        const int drawn = popup_paragraph(fb, NOTES_LIST_X, body_top, NOTES_LIST_W,
+                                          NOTES_BODY_PX, body, 64, (int)line_off, false);
+        y = body_top + drawn * body_step;
+        if (i + 1 < s_notes.count) {
+            // 本间隙分到的均分高度（比例分配，余数摊入前面的间隙）；分隔线
+            // 居间隙中段。/ This gap's share of the leftover (proportional, the
+            // / remainder spread into earlier gaps); divider centered in the gap.
+            int add = 0;
+            if (leftover > 0 && n_gaps) {
+                const unsigned g = i + 1 - TBL_PS(s_notes.page);
+                add = (int)((long long)leftover * (int)g / (int)n_gaps) -
+                      (int)((long long)leftover * (int)(g - 1) / (int)n_gaps);
+            }
+            popup_hline(fb, NOTES_LIST_X, NOTES_LIST_X + NOTES_LIST_W, y + 8 + add / 2);
+            y += 18 + add;
+        }
         ++i;
-    }
-    s_notes.rows_used[s_notes.page] = k;
-    if (k) {
-        // 页数随排版逐步确定：排到数据尾即精确；否则按本页行数估算并只增不减。
-        // / Page total firms up as layout proceeds: exact at the tail, else grown
-        // / from this page's row count (never shrinking).
-        const unsigned next_start = s_notes.page_start[s_notes.page] + k;
-        if (next_start >= s_notes.count) {
-            s_notes.pages = s_notes.page + 1;
-        } else {
-            const unsigned est = s_notes.page + 1 + (s_notes.count - next_start + k - 1) / k;
-            if (est > s_notes.pages) s_notes.pages = est;
-        }
+        line_off = 0;
     }
     // 底部分页栏：顶线 + 两竖线分成 上一页 / 页码 / 下一页 三格（撷思样式），
-    // 不可用方向浅色显示。/ Pager bar split into three cells; disabled side is dimmed.
+    // 不可用方向浅色显示。页码来自预排版，恒定。/ Pager bar; exact page count.
     popup_hline(fb, NOTES_LIST_X, NOTES_LIST_X + NOTES_LIST_W, NOTES_PAGER_Y);
     const int pager_mid_y = NOTES_PAGER_Y + NOTES_PAGER_H / 2;
     epd_fill_rect((EpdRect){NOTES_LIST_X + 196, NOTES_PAGER_Y + 12, 1, NOTES_PAGER_H - 24}, 0x9c, fb);
