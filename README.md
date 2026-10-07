@@ -6,6 +6,16 @@ An independent, open-source reading firmware for the **MindReset Read Pico (RDP-
 
 The current interface has Home, Bookshelf, Files, and Settings. It reads EPUB and TXT books from a TF card, remembers reading progress, and supports Wi-Fi, hotspot, or USB file transfer. The online flasher installs the same firmware image as the local `flash/` bundle.
 
+## What this fork adds: WeRead highlights & thoughts
+
+On top of the official rc85, this fork adds a full **highlights & thoughts pipeline** for books downloaded via WeRead transfer (submitted upstream as [PR #14](https://github.com/wegooo-cell/read-pico-reader/pull/14)):
+
+- **Full fetch**: pulls every highlighted sentence and all community thoughts per chapter, with resume support and rate limiting; live progress (N/M chapters · X thoughts) on the book detail page
+- **In-page highlights**: dotted underlines drawn on highlighted sentences, mapped to the actual text layout
+- **Thoughts popup**: tap a highlighted sentence to browse thoughts with full text and adaptive pagination
+- **Offline ready**: everything is cached on the TF card and works without a network
+- **Zero intrusion**: purely additive changes; no existing feature (swipe paging, mixed text/image layout, Wi-Fi) is affected
+
 ## Current release: rc85
 
 Improved text-only page turns in normal and full-screen reading, EPUB image compatibility, named-device Bluetooth scanning and Bluetooth pager compatibility. Choose **Reading settings → Page-turn effect → Default effect** to try the text-turn optimization. Water turns and periodic/manual cleanup remain available. See the [changelog](docs/CHANGELOG.md).
