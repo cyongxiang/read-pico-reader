@@ -969,6 +969,47 @@ extern "C" bool weread_notes_book_id(char* out, size_t cap) {
     return true;
 }
 
+// ---- 书级只读统计：书架角标与详情页标记（不依赖 bind，直接扫缓存目录）。 ----
+// ---- Book-level read-only stats: shelf badge and detail marker (bind-free). ----
+extern "C" bool weread_notes_book_stats(const char* book_id, unsigned* chapters_cached,
+                                        unsigned* chapters_total, unsigned* highlights) {
+    if (chapters_cached) *chapters_cached = 0;
+    if (chapters_total) *chapters_total = 0;
+    if (highlights) *highlights = 0;
+    if (!book_id || !book_id[0]) return false;
+    HalFile dir;
+    if (!dir.open(Storage.map(notes_dir(book_id)), "rb") || !dir.isDirectory()) return false;
+    uint32_t rows_total = 0, files = 0;
+    char name[64];
+    while (true) {
+        HalFile next = dir.openNextFile();
+        if (!next.isOpen()) break;
+        const size_t len = next.getName(name, sizeof(name));
+        // 只认 ch_XXXXXX.bin：.part 半成品与 meta.bin 不计入。/ Only finished ch files.
+        if (len < 6 || strncmp(name, "ch_", 3) || strcmp(name + len - 4, ".bin")) continue;
+        // 章头 = magic u32 + version u16 + uid[64] + total_rows u32 → 偏移 70，只读头部。
+        // / Chapter header: magic + version + uid[64] + total_rows at offset 70; header only.
+        uint32_t rows = 0;
+        if (next.seek(70) && read_u32_file(next, &rows)) {
+            rows_total += rows;
+            ++files;
+        }
+    }
+    if (!files) return false;
+    if (chapters_cached) *chapters_cached = (unsigned)files;
+    if (highlights) *highlights = (unsigned)rows_total;
+    if (chapters_total) {
+        HalFile meta;
+        // meta 头 = magic u32 + version u16 + vid[64] + chapter_count u32，同一偏移 70。
+        // / meta shares the same 70-byte prefix; chapter_count sits at offset 70.
+        uint32_t total = 0;
+        if (Storage.openFileForRead("meta", meta_cache_path(book_id), meta) && meta.seek(70) &&
+            read_u32_file(meta, &total))
+            *chapters_total = (unsigned)total;
+    }
+    return true;
+}
+
 extern "C" bool weread_notes_chapter_uid(uint32_t spine, char* out, size_t cap) {
     if (!out || !cap || !g_notes.uids || spine >= g_notes.count || !g_notes.uids[spine][0]) return false;
     snprintf(out, cap, "%s", g_notes.uids[spine]);

@@ -63,6 +63,15 @@ bool weread_notes_ready(void);
 /// / The bound remote book id, for weread_thoughts_open on the engine browse cache.
 bool weread_notes_book_id(char* out, size_t cap);
 
+/// 书级只读统计（书架角标 / 详情页标记用，不依赖 bind）：扫描该书章缓存目录，
+/// highlights 为已缓存划线句总数（各章文件头累加），chapters_cached 为已完成
+/// 章数；chapters_total 取自 meta（缺失为 0）。返回 false = 无任何已完成章缓存。
+/// / Book-level read-only stats for shelf badge / detail marker (no bind needed):
+/// / scans the book's chapter cache dir and sums file headers; false when the
+/// / book has no completed chapter cache.
+bool weread_notes_book_stats(const char* book_id, unsigned* chapters_cached,
+                             unsigned* chapters_total, unsigned* highlights);
+
 /// spine 章的云端 chapterUid（review/list 按章缓存定位用）。/ Remote chapter uid of a spine.
 bool weread_notes_chapter_uid(uint32_t spine, char* out, size_t cap);
 
